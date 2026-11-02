@@ -8,7 +8,10 @@ authors = [
 ]
 requires-python = ">=3.14"
 dependencies = [
-    "streamlit>=1.66.1",
+    "langchain==1.4.7",
+    "langchain-openrouter==0.2.9",
+    "python-dotenv==1.2.4",
+    "streamlit==1.66.1",
 ]
 
 [project.scripts]
