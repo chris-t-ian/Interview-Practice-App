@@ -1,0 +1,17 @@
+[project]
+name = "langchain-streamlit-app"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "email", email = "chris.schneider@tuebingen.mpg.de" }
+]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+langchain-streamlit-app = "langchain_streamlit_app:main"
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
