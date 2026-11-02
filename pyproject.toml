@@ -6,8 +6,10 @@ readme = "README.md"
 authors = [
     { name = "email", email = "chris.schneider@tuebingen.mpg.de" }
 ]
-requires-python = ">=3.9"
-dependencies = []
+requires-python = ">=3.14"
+dependencies = [
+    "streamlit>=1.66.1",
+]
 
 [project.scripts]
 langchain-streamlit-app = "langchain_streamlit_app:main"
