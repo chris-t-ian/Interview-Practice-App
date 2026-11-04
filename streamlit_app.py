@@ -7,6 +7,7 @@ widgets, caching and rendering.
 import json
 import re
 
+import pandas as pd
 import streamlit as st
 from pydantic import ValidationError
 
@@ -28,7 +29,9 @@ from langchain_streamlit_app.llm import build_chat_model, effective_config
 from langchain_streamlit_app.prompts import DEFAULT_PROMPT_KEY, PROMPTS
 from langchain_streamlit_app.settings import ModelSettings
 
-st.set_page_config(page_title="Job description analyser", page_icon=":material/work:", layout="wide")
+st.set_page_config(
+    page_title="Job description analyser", page_icon=":material/work:", layout="wide"
+)
 
 # Loads OPENROUTER_API_KEY (and optionally OPENROUTER_MODEL) from .env.
 cfg.load_env()
@@ -53,6 +56,10 @@ for key, value in WIDGET_DEFAULTS.items():
 st.session_state.setdefault("prompt_key", DEFAULT_PROMPT_KEY)
 # Last successful AnalysisResult; kept so reruns/tab switches don't re-call the API.
 st.session_state.setdefault("last_result", None)
+# Increments per successful analysis so checklist widget keys reset for a new result.
+st.session_state.setdefault("result_id", 0)
+# Open state of the JD input expander (collapses after a valid submit).
+st.session_state.setdefault("jd_expander", True)
 
 
 def reset_settings() -> None:
@@ -208,21 +215,45 @@ except Exception as exc:  # e.g. invalid parameters rejected by ChatOpenRouter
 with st.sidebar.expander("Effective config", icon=":material/tune:"):
     st.json(effective_config(chat_model))
 
-with st.form("jd_form"):
-    jd_text = st.text_area(
-        "Job description",
-        height=320,
-        placeholder="Paste the full job description here…",
-    )
-    study_days = st.number_input(
-        "Days until interview",
-        min_value=MIN_STUDY_DAYS,
-        max_value=MAX_STUDY_DAYS,
-        value=DEFAULT_STUDY_DAYS,
-        step=1,
-        help=f"The study plan assumes about {DEFAULT_HOURS_PER_DAY:g} hours of study per day.",
-    )
-    submitted = st.form_submit_button("Analyse", icon=":material/search:", type="primary")
+
+
+def collapse_jd_input() -> None:
+    """Submit callback: collapse the JD input once a non-empty JD is sent."""
+    if st.session_state.get("jd_text", "").strip():
+        st.session_state.jd_expander = False
+
+
+def jd_expander_label() -> str:
+    jd = st.session_state.get("jd_text", "").strip()
+    if st.session_state.jd_expander or not jd:
+        return "Job description"
+    first_line = jd.splitlines()[0]
+    preview = first_line if len(first_line) <= 80 else first_line[:80].rstrip() + "…"
+    return f"Job description: {preview}"
+
+
+with st.expander(
+    jd_expander_label(), key="jd_expander", on_change="rerun", icon=":material/description:"
+):
+    with st.form("jd_form", border=False):
+        jd_text = st.text_area(
+            "Job description",
+            key="jd_text",
+            height=320,
+            placeholder="Paste the full job description here…",
+            label_visibility="collapsed",
+        )
+        study_days = st.number_input(
+            "Days until interview",
+            min_value=MIN_STUDY_DAYS,
+            max_value=MAX_STUDY_DAYS,
+            value=DEFAULT_STUDY_DAYS,
+            step=1,
+            help=f"The study plan assumes about {DEFAULT_HOURS_PER_DAY:g} hours of study per day.",
+        )
+        submitted = st.form_submit_button(
+            "Analyse", icon=":material/search:", type="primary", on_click=collapse_jd_input
+        )
 
 if submitted:
     if not jd_text.strip():
@@ -235,12 +266,16 @@ if submitted:
                 st.session_state.last_result = analyze_with_metadata(
                     jd_text, settings, prompt_key, int(study_days), agent=agent
                 )
+            st.session_state.result_id += 1
+            for old in [k for k in st.session_state if str(k).startswith("chk_")]:
+                del st.session_state[old]  # checklist ticks belong to the previous result
         except AnalysisError as exc:
             st.session_state.last_result = None
             st.error(str(exc), title="Analysis failed")
         except Exception as exc:  # anything unexpected, e.g. while building the agent
             st.session_state.last_result = None
             st.error(f"{type(exc).__name__}: {exc}", title="Analysis failed")
+
 
 # ---- Results ----------------------------------------------------------------
 result: AnalysisResult | None = st.session_state.last_result
@@ -249,21 +284,127 @@ if result is None:
 
 analysis = result.analysis
 usage = result.usage
-planned_hours = total_study_hours(analysis)
+result_spec = PROMPTS[result.prompt_key]
 
-st.divider()
-st.subheader(analysis.role_title)
-with st.container(horizontal=True):
-    st.badge(analysis.seniority, icon=":material/badge:", color="blue")
-    st.badge(PROMPTS[result.prompt_key].name, icon=":material/psychology:", color="violet")
-    st.badge(f"Interview in {result.study_days} d", icon=":material/event:", color="gray")
+CATEGORY_COLORS = {"technical": "blue", "soft": "violet", "domain": "orange", "tool": "green"}
+PRIORITY_COLORS = {"must-have": "red", "nice-to-have": "gray"}
+PROFICIENCY_COLORS = {
+    "beginner": "green",
+    "fluent": "yellow",
+    "professional": "red",
+    "unknown": "gray",
+}
+MENTIONED_COLORS = {"Explicit": "blue", "Implied": "orange"}
+DIFFICULTY_COLORS = {"easy": "green", "medium": "orange", "hard": "red"}
 
 
 def _fmt_int(value: int | None) -> str:
     return f"{value:,}" if value is not None else "n/a"
 
 
+def _mentioned(inferred: bool) -> str:
+    return "Implied" if inferred else "Explicit"
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>()#+!|~:$])")
+
+
+def _md_escape(text: str) -> str:
+    """Escape Markdown so model text renders literally inside st.table cells."""
+    return _MD_SPECIAL.sub(r"\\\1", text.replace("\n", " "))
+
+
+def _md_badge(label: str, color: str) -> str:
+    return f":{color}-badge[{_md_escape(label)}]"
+
+
+# Tooltip look for the evidence shown when hovering a skill name.
+TOOLTIP_PROPS = [
+    ("visibility", "hidden"),
+    ("position", "absolute"),
+    ("z-index", "10"),
+    ("background-color", "rgba(30, 30, 30, 0.95)"),
+    ("color", "white"),
+    ("padding", "6px 10px"),
+    ("border-radius", "6px"),
+    ("font-size", "0.85em"),
+    ("white-space", "normal"),
+    ("width", "max-content"),
+    ("max-width", "320px"),
+    ("transform", "translate(-20px, -110%)"),
+]
+
+
+def _css_safe(text: str) -> str:
+    """Text for a CSS `content:` string (pandas puts tooltips there unescaped)."""
+    return text.replace("\\", "/").replace('"', "'").replace("\n", " ")
+
+
+def skills_table(skills) -> "pd.io.formats.style.Styler":
+    """Skill table with colored badges; the evidence is a hover tooltip on the skill name."""
+
+    def badges(values: list[str], colors: dict[str, str], labels=None) -> list[str]:
+        labels = labels or values
+        return [_md_badge(lbl, colors.get(v, "gray")) for v, lbl in zip(values, labels)]
+
+    proficiency = [s.proficiency for s in skills]
+    mentioned = [_mentioned(s.inferred) for s in skills]
+    df = pd.DataFrame(
+        {
+            "Skill": [_md_escape(s.name) for s in skills],
+            "Category": badges([s.category for s in skills], CATEGORY_COLORS),
+            "Priority": badges([s.priority for s in skills], PRIORITY_COLORS),
+            "Proficiency level": badges(
+                proficiency, PROFICIENCY_COLORS, [p.capitalize() for p in proficiency]
+            ),
+            "How it's mentioned": badges(mentioned, MENTIONED_COLORS),
+        }
+    )
+    tooltips = pd.DataFrame("", index=df.index, columns=df.columns)
+    tooltips["Skill"] = [f"Evidence: “{_css_safe(s.evidence)}”" for s in skills]
+    return df.style.set_tooltips(tooltips, props=TOOLTIP_PROPS)
+
+
+@st.dialog("Raw JSON", width="large", icon=":material/data_object:")
+def show_raw_json(data: dict) -> None:
+    st.json(data)
+
+
+# Header: role + toolbar
+analysis_json = analysis.model_dump(mode="json")
+slug = re.sub(r"[^a-z0-9]+", "-", analysis.role_title.lower()).strip("-") or "analysis"
+
+st.divider()
+head_left, head_right = st.columns([3, 2], vertical_alignment="center")
+with head_left:
+    st.subheader(analysis.role_title)
+    with st.container(horizontal=True):
+        st.badge(analysis.seniority, icon=":material/badge:", color="blue")
+        st.badge(f"Interview in {result.study_days} d", icon=":material/event:", color="gray")
+with head_right:
+    with st.container(horizontal=True, horizontal_alignment="right"):
+        if st.button("View JSON", icon=":material/data_object:"):
+            show_raw_json(analysis_json)
+        st.download_button(
+            "JSON",
+            data=json.dumps(analysis_json, indent=2, ensure_ascii=False),
+            file_name=f"{slug}.json",
+            mime="application/json",
+            icon=":material/download:",
+            on_click="ignore",
+        )
+        st.download_button(
+            "Markdown",
+            data=to_markdown(result),
+            file_name=f"{slug}.md",
+            mime="text/markdown",
+            icon=":material/download:",
+            on_click="ignore",
+        )
+
+# Dashboard metrics
 with st.container(horizontal=True):
+    st.metric("Prompt", result_spec.name, help=f"Technique: {result_spec.technique}", border=True)
     st.metric("Latency", f"{usage.latency_s:.1f} s", border=True)
     st.metric(
         "Tokens (in / out)",
@@ -281,12 +422,6 @@ with st.container(horizontal=True):
         help="As reported by OpenRouter.",
         border=True,
     )
-    st.metric(
-        "Study hours",
-        f"{planned_hours:g} / {result.time_budget_hours:g}",
-        help="Planned hours / time budget.",
-        border=True,
-    )
 if usage.model_name or usage.provider:
     st.caption(
         f"Served by `{usage.model_name or 'unknown model'}`"
@@ -297,45 +432,24 @@ if analysis.reasoning:
     with st.expander("Reasoning", icon=":material/lightbulb:"):
         st.markdown(analysis.reasoning)
 
-skills_tab, topics_tab, plan_tab, json_tab = st.tabs(
-    [
-        f":material/checklist: Skills ({len(analysis.skills)})",
-        f":material/forum: Interview topics ({len(analysis.interview_topics)})",
-        ":material/calendar_month: Study plan",
-        ":material/data_object: Raw JSON",
-    ]
-)
+# Skills (left) and interview topics (right)
+skills_col, topics_col = st.columns(2, gap="large")
 
-with skills_tab:
-    must = sum(s.priority == "must-have" for s in analysis.skills)
-    st.caption(f"{must} must-have · {len(analysis.skills) - must} nice-to-have")
-    st.dataframe(
-        [
-            {
-                "Skill": s.name,
-                "Category": s.category,
-                "Priority": s.priority,
-                "Inferred": s.inferred,
-                "Evidence": s.evidence,
-            }
-            for s in analysis.skills
-        ],
+with skills_col:
+    st.subheader(f":material/checklist: Key skills ({len(analysis.skills)})", divider="gray")
+    st.table(
+        skills_table(analysis.skills),
         hide_index=True,
-        column_config={
-            "Skill": st.column_config.TextColumn(width="medium", pinned=True),
-            "Category": st.column_config.TextColumn(width="small"),
-            "Priority": st.column_config.TextColumn(width="small"),
-            "Inferred": st.column_config.CheckboxColumn(
-                width="small", help="Only implied by the JD, not stated explicitly."
-            ),
-            "Evidence": st.column_config.TextColumn(width="large"),
-        },
-        alt="Key skills from the job description",
+        border="horizontal",
+        alt="Key skills with category, priority, proficiency level and how they are mentioned",
     )
+    st.caption(":material/info: Hover over a skill to see the evidence from the job description.")
 
-DIFFICULTY_COLORS = {"easy": "green", "medium": "orange", "hard": "red"}
-
-with topics_tab:
+with topics_col:
+    st.subheader(
+        f":material/forum: Likely interview topics ({len(analysis.interview_topics)})",
+        divider="gray",
+    )
     for i, topic in enumerate(analysis.interview_topics):
         color = DIFFICULTY_COLORS.get(topic.difficulty, "gray")
         with st.expander(f"{topic.topic} :{color}-badge[{topic.difficulty}]", expanded=i == 0):
@@ -344,48 +458,43 @@ with topics_tab:
                 "\n".join(f"{n}. {q}" for n, q in enumerate(topic.example_questions, start=1))
             )
 
-with plan_tab:
-    st.dataframe(
-        [
-            {
-                "Block": item.day_or_block,
-                "Focus": item.focus,
-                "Activities": "\n".join(f"• {a}" for a in item.activities),
-                "Resources": ", ".join(item.resources),
-                "Hours": item.estimated_hours,
-            }
-            for item in analysis.study_plan
-        ],
-        hide_index=True,
-        column_config={
-            "Block": st.column_config.TextColumn(width="small"),
-            "Activities": st.column_config.TextColumn(width="large"),
-            "Hours": st.column_config.NumberColumn(format="%.1f h", width="small"),
-        },
-        alt="Study plan",
+
+# Study plan: checklist cards. A fragment, so ticking a box reruns only this part.
+@st.fragment
+def render_study_plan(result: AnalysisResult, result_id: int) -> None:
+    plan = result.analysis.study_plan
+    planned = total_study_hours(result.analysis)
+    keys = [
+        [f"chk_{result_id}_{i}_{j}" for j in range(len(item.activities))]
+        for i, item in enumerate(plan)
+    ]
+    total = sum(len(ks) for ks in keys)
+    done = sum(bool(st.session_state.get(k)) for ks in keys for k in ks)
+
+    st.subheader(
+        f":material/calendar_month: Study plan · {planned:g} / {result.time_budget_hours:g} h",
+        divider="gray",
+        help="Planned hours / time budget.",
     )
-    st.markdown(f"**Total: {planned_hours:g} h** of a {result.time_budget_hours:g} h budget.")
-    if planned_hours > result.time_budget_hours:
+    if planned > result.time_budget_hours:
         st.warning("The plan exceeds the time budget.", icon=":material/warning:")
+    if total:
+        st.progress(done / total, text=f"{done} of {total} activities done")
 
-with json_tab:
-    st.json(analysis.model_dump(mode="json"))
+    per_row = 3
+    for start in range(0, len(plan), per_row):
+        cols = st.columns(per_row)
+        for col, i in zip(cols, range(start, min(start + per_row, len(plan)))):
+            item = plan[i]
+            block_done = bool(keys[i]) and all(st.session_state.get(k) for k in keys[i])
+            with col.container(border=True, height="stretch"):
+                status = " :green[:material/check_circle:]" if block_done else ""
+                st.caption(f"{item.day_or_block} · {item.estimated_hours:g} h{status}")
+                st.markdown(f"**{item.focus}**")
+                for activity, key in zip(item.activities, keys[i]):
+                    st.checkbox(activity, key=key)
+                if item.resources:
+                    st.caption(f":material/menu_book: {', '.join(item.resources)}")
 
-slug = re.sub(r"[^a-z0-9]+", "-", analysis.role_title.lower()).strip("-") or "analysis"
-with st.container(horizontal=True):
-    st.download_button(
-        "Download JSON",
-        data=json.dumps(analysis.model_dump(mode="json"), indent=2, ensure_ascii=False),
-        file_name=f"{slug}.json",
-        mime="application/json",
-        icon=":material/download:",
-        on_click="ignore",
-    )
-    st.download_button(
-        "Download Markdown",
-        data=to_markdown(result),
-        file_name=f"{slug}.md",
-        mime="text/markdown",
-        icon=":material/download:",
-        on_click="ignore",
-    )
+
+render_study_plan(result, st.session_state.result_id)

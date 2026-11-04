@@ -69,9 +69,9 @@ SECURITY_RULES = (RULE_UNTRUSTED_JD, RULE_GROUNDED_SKILLS, RULE_TIME_BUDGET, RUL
 
 _TASK = (
     "Analyse the job description and return: the role title and seniority; the key skills "
-    "(technical, soft, domain, tool) with priority and evidence; the interview topics most "
-    "likely to come up, each with 2-4 realistic example questions and a difficulty; and a "
-    "short, ordered study plan."
+    "(technical, soft, domain, tool) with priority, required proficiency level and "
+    "evidence; the interview topics most likely to come up, each with 2-4 realistic "
+    "example questions and a difficulty; and a short, ordered study plan."
 )
 
 # --------------------------------------------------------------------------
@@ -88,14 +88,14 @@ _FEW_SHOT_EXAMPLES: list[tuple[str, float, dict]] = [
             "role_title": "Junior Data Analyst",
             "seniority": "junior",
             "skills": [
-                {"name": "SQL", "category": "technical", "priority": "must-have",
+                {"name": "SQL", "category": "technical", "priority": "must-have", "proficiency": "fluent",
                  "evidence": "Must have: solid SQL"},
-                {"name": "Excel", "category": "tool", "priority": "must-have",
+                {"name": "Excel", "category": "tool", "priority": "must-have", "proficiency": "unknown",
                  "evidence": "Must have: ... Excel"},
-                {"name": "Tableau / Power BI", "category": "tool", "priority": "nice-to-have",
+                {"name": "Tableau / Power BI", "category": "tool", "priority": "nice-to-have", "proficiency": "unknown",
                  "evidence": "Nice to have: Tableau or Power BI"},
                 {"name": "Presenting to non-technical audiences", "category": "soft",
-                 "priority": "must-have", "evidence": "present findings to store managers",
+                 "priority": "must-have", "proficiency": "unknown", "evidence": "present findings to store managers",
                  "inferred": True},
             ],
             "interview_topics": [
@@ -128,16 +128,16 @@ _FEW_SHOT_EXAMPLES: list[tuple[str, float, dict]] = [
             "role_title": "Senior Backend Engineer",
             "seniority": "senior",
             "skills": [
-                {"name": "Java / Spring", "category": "technical", "priority": "must-have",
+                {"name": "Java / Spring", "category": "technical", "priority": "must-have", "proficiency": "professional",
                  "evidence": "Java/Spring services"},
                 {"name": "Distributed system design", "category": "technical",
-                 "priority": "must-have", "evidence": "high-throughput ... drive architecture "
+                 "priority": "must-have", "proficiency": "professional", "evidence": "high-throughput ... drive architecture "
                  "decisions", "inferred": True},
-                {"name": "AWS", "category": "tool", "priority": "must-have",
+                {"name": "AWS", "category": "tool", "priority": "must-have", "proficiency": "fluent",
                  "evidence": "services on AWS"},
-                {"name": "Mentoring", "category": "soft", "priority": "must-have",
+                {"name": "Mentoring", "category": "soft", "priority": "must-have", "proficiency": "unknown",
                  "evidence": "Mentor engineers"},
-                {"name": "Kafka", "category": "tool", "priority": "nice-to-have",
+                {"name": "Kafka", "category": "tool", "priority": "nice-to-have", "proficiency": "unknown",
                  "evidence": "Kafka experience preferred"},
             ],
             "interview_topics": [

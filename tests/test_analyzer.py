@@ -23,9 +23,9 @@ ANALYSIS = JobAnalysis.model_validate(
         "seniority": "junior",
         "skills": [
             {"name": "Python", "category": "technical", "priority": "must-have",
-             "evidence": "Must have Python"},
+             "proficiency": "fluent", "evidence": "Must have Python"},
             {"name": "Docker | containers", "category": "tool", "priority": "nice-to-have",
-             "evidence": "Nice to have: Docker", "inferred": False},
+             "proficiency": "beginner", "evidence": "Nice to have: Docker", "inferred": False},
         ],
         "interview_topics": [
             {"topic": "Python basics", "why_likely": "Core must-have.",

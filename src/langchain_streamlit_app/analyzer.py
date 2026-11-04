@@ -201,13 +201,14 @@ def to_markdown(result: AnalysisResult) -> str:
         "",
         "## Key skills",
         "",
-        "| Skill | Category | Priority | Inferred | Evidence |",
-        "|---|---|---|---|---|",
+        "| Skill | Category | Priority | Proficiency | How it's mentioned | Evidence |",
+        "|---|---|---|---|---|---|",
     ]
     for s in a.skills:
-        inferred = "yes" if s.inferred else "no"
+        mentioned = "Implied" if s.inferred else "Explicit"
         lines.append(
-            f"| {_cell(s.name)} | {s.category} | {s.priority} | {inferred} | {_cell(s.evidence)} |"
+            f"| {_cell(s.name)} | {s.category} | {s.priority} | {s.proficiency} | {mentioned} "
+            f"| {_cell(s.evidence)} |"
         )
     lines += ["", "## Likely interview topics", ""]
     for t in a.interview_topics:

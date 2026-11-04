@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 SkillCategory = Literal["technical", "soft", "domain", "tool"]
 SkillPriority = Literal["must-have", "nice-to-have"]
 Difficulty = Literal["easy", "medium", "hard"]
+Proficiency = Literal["beginner", "fluent", "professional", "unknown"]
 Seniority = Literal["intern", "junior", "mid", "senior", "lead", "unknown"]
 
 
@@ -28,6 +29,18 @@ class Skill(BaseModel):
     )
     priority: SkillPriority = Field(
         description="'must-have' if the JD requires it, 'nice-to-have' if it is a plus or preferred."
+    )
+    proficiency: Proficiency = Field(
+        description=(
+            "Proficiency level the JD asks for in this skill, based on its wording. "
+            "'beginner': basic knowledge or first exposure is enough (e.g. 'basic knowledge', "
+            "'familiarity with', 'first experience'). "
+            "'fluent': solid, independent working knowledge (e.g. 'solid', 'good knowledge', "
+            "'hands-on experience', 'very good', or fluent for a language). "
+            "'professional': advanced or expert level (e.g. 'expert', 'deep expertise', "
+            "'extensive experience', 'X+ years', owning or leading it). "
+            "'unknown': the JD gives no indication of the level."
+        )
     )
     evidence: str = Field(
         description="Short quote or close paraphrase from the JD that shows this skill is wanted."

@@ -421,8 +421,10 @@ name = "langchain-streamlit-app"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "jinja2" },
     { name = "langchain" },
     { name = "langchain-openrouter" },
+    { name = "pandas" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "streamlit" },
@@ -435,8 +437,10 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "jinja2", specifier = "==3.1.6" },
     { name = "langchain", specifier = "==1.4.7" },
     { name = "langchain-openrouter", specifier = "==0.2.9" },
+    { name = "pandas", specifier = "==3.1.0" },
     { name = "pydantic", specifier = "==2.12.5" },
     { name = "python-dotenv", specifier = "==1.2.4" },
     { name = "streamlit", specifier = "==1.66.1" },
