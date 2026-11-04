@@ -15,9 +15,9 @@ schema; the prompts only reference its field names.
 """
 
 import json
-import re
 from dataclasses import dataclass
 
+from langchain_streamlit_app.guards import neutralize_delimiters
 from langchain_streamlit_app.schemas import JobAnalysis
 
 TIME_BUDGET_PLACEHOLDER = "{time_budget_hours}"
@@ -390,15 +390,11 @@ def validate_time_budget(hours: float) -> float:
     return hours
 
 
-# Matches opening/closing JD tags with any case or inner whitespace.
-_JD_TAG_RE = re.compile(r"<\s*/?\s*job_description\s*>", re.IGNORECASE)
-
-
 def wrap_job_description(jd: str) -> str:
     """Wrap the JD in delimiter tags for the user message.
 
     Any JD tags inside the text are neutralised so the JD cannot close the
     data block early and smuggle in text that looks like it is outside it.
     """
-    cleaned = _JD_TAG_RE.sub("[tag removed]", jd.strip())
+    cleaned = neutralize_delimiters(jd.strip())
     return f"{JD_OPEN_TAG}\n{cleaned}\n{JD_CLOSE_TAG}"

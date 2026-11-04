@@ -1,8 +1,8 @@
 """Analysis pipeline: prompt -> model -> parsed `JobAnalysis`.
 
-No Streamlit imports, so this module can be tested on its own. Input guards
-(guards.py) will slot in at the start of `analyze_with_metadata` later; for now
-only basic checks run here.
+No Streamlit imports, so this module can be tested on its own. The content
+guards (guards.py) run at the start of `analyze_with_metadata`, before the agent
+is built or called; only the sanitised text reaches the model.
 
 The UI caches the agent itself (see `build_analysis_agent`) and passes it in;
 without an agent argument, a fresh one is built for each call.
@@ -14,6 +14,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage
 
+from langchain_streamlit_app.guards import GuardResult, run_guards
 from langchain_streamlit_app.llm import build_agent, build_chat_model
 from langchain_streamlit_app.prompts import (
     MAX_TIME_BUDGET_HOURS,
@@ -31,6 +32,14 @@ MAX_STUDY_DAYS = 60
 
 class AnalysisError(Exception):
     """A readable error for the UI (bad input, failed request, unparsable output)."""
+
+
+class InputRejected(AnalysisError):
+    """The input guards blocked the job description; `guard` says which rule fired."""
+
+    def __init__(self, guard: GuardResult):
+        super().__init__(guard.reason or "The job description was rejected.")
+        self.guard = guard
 
 
 @dataclass(frozen=True)
@@ -99,10 +108,13 @@ def analyze_with_metadata(
 ) -> AnalysisResult:
     """Run the full pipeline and return the analysis with usage/latency metadata.
 
-    Raises `AnalysisError` with a readable message on any failure.
+    Raises `InputRejected` if a guard blocks the JD and `AnalysisError` with a
+    readable message on any other failure.
     """
-    if not jd or not jd.strip():
-        raise AnalysisError("Please paste a job description first.")
+    guard = run_guards(jd)
+    if not guard.ok:
+        raise InputRejected(guard)
+    jd = guard.sanitized_text
     try:
         get_prompt(prompt_key)
     except KeyError as exc:

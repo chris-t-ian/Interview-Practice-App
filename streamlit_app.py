@@ -19,11 +19,18 @@ from langchain_streamlit_app.analyzer import (
     MIN_STUDY_DAYS,
     AnalysisError,
     AnalysisResult,
+    InputRejected,
     analyze_with_metadata,
     build_analysis_agent,
     time_budget_for,
     to_markdown,
     total_study_hours,
+)
+from langchain_streamlit_app.guards import (
+    GuardResult,
+    check_rate_limit,
+    record_request,
+    run_guards,
 )
 from langchain_streamlit_app.llm import build_chat_model, effective_config
 from langchain_streamlit_app.prompts import DEFAULT_PROMPT_KEY, PROMPTS
@@ -60,6 +67,8 @@ st.session_state.setdefault("last_result", None)
 st.session_state.setdefault("result_id", 0)
 # Open state of the JD input expander (collapses after a valid submit).
 st.session_state.setdefault("jd_expander", True)
+# Timestamps of recent analyses, for the per-session rate limit (guards.py).
+st.session_state.setdefault("analysis_times", [])
 
 
 def reset_settings() -> None:
@@ -218,8 +227,8 @@ with st.sidebar.expander("Effective config", icon=":material/tune:"):
 
 
 def collapse_jd_input() -> None:
-    """Submit callback: collapse the JD input once a non-empty JD is sent."""
-    if st.session_state.get("jd_text", "").strip():
+    """Submit callback: collapse the JD input once a JD passes the guards."""
+    if run_guards(st.session_state.get("jd_text", "")).ok:
         st.session_state.jd_expander = False
 
 
@@ -255,20 +264,38 @@ with st.expander(
             "Analyse", icon=":material/search:", type="primary", on_click=collapse_jd_input
         )
 
+def show_blocked(guard: GuardResult, title: str) -> None:
+    st.error(guard.reason, title=title, icon=":material/block:")
+    st.caption(f"Rule: `{guard.rule}`")
+
+
 if submitted:
-    if not jd_text.strip():
-        st.error("Paste a job description first.", title="Nothing to analyse")
+    # Guards run before any agent is built or model is called.
+    rate = check_rate_limit(st.session_state.analysis_times)
+    guard = run_guards(jd_text)
+    if not rate.ok:
+        show_blocked(rate, "Too many requests")
+    elif not guard.ok:
+        st.session_state.last_result = None
+        title = "Input blocked" if guard.rule.startswith("injection") else "Invalid input"
+        show_blocked(guard, title)
     else:
+        for warning in guard.warnings:
+            st.warning(warning, icon=":material/warning:")
         try:
             hours = time_budget_for(int(study_days))
             agent = get_analysis_agent(settings, prompt_key, hours)
+            record_request(st.session_state.analysis_times)
             with st.spinner(f"Analysing with {spec.name}…"):
                 st.session_state.last_result = analyze_with_metadata(
-                    jd_text, settings, prompt_key, int(study_days), agent=agent
+                    guard.sanitized_text, settings, prompt_key, int(study_days), agent=agent
                 )
             st.session_state.result_id += 1
             for old in [k for k in st.session_state if str(k).startswith("chk_")]:
                 del st.session_state[old]  # checklist ticks belong to the previous result
+        except InputRejected as exc:
+            st.session_state.last_result = None
+            show_blocked(exc.guard, "Input blocked")
         except AnalysisError as exc:
             st.session_state.last_result = None
             st.error(str(exc), title="Analysis failed")
