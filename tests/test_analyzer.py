@@ -1,20 +1,26 @@
+import httpx
 import pytest
+from langchain.agents.structured_output import StructuredOutputValidationError
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.errors import GraphRecursionError
+from openrouter.errors import OpenRouterError
 
 from langchain_streamlit_app import analyzer
 from langchain_streamlit_app.analyzer import (
     AnalysisError,
     InputRejected,
-    analyze,
     analyze_with_metadata,
     build_analysis_agent,
     build_user_message,
     time_budget_for,
     to_markdown,
 )
+from langchain_streamlit_app.llm import build_chat_model
 from langchain_streamlit_app.prompts import JD_CLOSE_TAG, JD_OPEN_TAG, MAX_TIME_BUDGET_HOURS
 from langchain_streamlit_app.schemas import JobAnalysis
 from langchain_streamlit_app.settings import ModelSettings
+
+FAKE_KEY = "sk-or-v1-0123456789abcdef-test"
 
 JD = (
     "Junior Python Developer (m/f/d), full-time.\n\n"
@@ -28,37 +34,66 @@ ANALYSIS = JobAnalysis.model_validate(
         "role_title": "Junior Python Developer",
         "seniority": "junior",
         "skills": [
-            {"name": "Python", "category": "technical", "priority": "must-have",
-             "proficiency": "fluent", "evidence": "Must have Python"},
-            {"name": "Docker | containers", "category": "tool", "priority": "nice-to-have",
-             "proficiency": "beginner", "evidence": "Nice to have: Docker", "inferred": False},
+            {
+                "name": "Python",
+                "category": "technical",
+                "priority": "must-have",
+                "proficiency": "fluent",
+                "evidence": "Must have Python",
+            },
+            {
+                "name": "Docker | containers",
+                "category": "tool",
+                "priority": "nice-to-have",
+                "proficiency": "beginner",
+                "evidence": "Nice to have: Docker",
+                "inferred": False,
+            },
         ],
         "interview_topics": [
-            {"topic": "Python basics", "why_likely": "Core must-have.",
-             "example_questions": ["List vs tuple?", "What is a generator?"],
-             "difficulty": "easy"},
+            {
+                "topic": "Python basics",
+                "why_likely": "Core must-have.",
+                "example_questions": ["List vs tuple?", "What is a generator?"],
+                "difficulty": "easy",
+            },
         ],
         "study_plan": [
-            {"day_or_block": "Day 1", "focus": "Python", "activities": ["Kata"],
-             "resources": ["official Python docs"], "estimated_hours": 2},
-            {"day_or_block": "Day 2", "focus": "SQL", "activities": ["Joins"],
-             "resources": [], "estimated_hours": 1.5},
+            {
+                "day_or_block": "Day 1",
+                "focus": "Python",
+                "activities": ["Kata"],
+                "resources": ["official Python docs"],
+                "estimated_hours": 2,
+            },
+            {
+                "day_or_block": "Day 2",
+                "focus": "SQL",
+                "activities": ["Joins"],
+                "resources": [],
+                "estimated_hours": 1.5,
+            },
         ],
     }
 )
 
 
 class StubAgent:
-    def __init__(self, result=None, exc=None):
-        self.result = result
-        self.exc = exc
-        self.calls = []
+    """Fake agent. `outcomes` is a list of results (dicts) or exceptions, one per call;
+    the last one repeats."""
 
-    def invoke(self, payload):
+    def __init__(self, result=None, exc=None, outcomes=None):
+        self.outcomes = outcomes or [exc if exc is not None else result]
+        self.calls = []
+        self.configs = []
+
+    def invoke(self, payload, config=None):
         self.calls.append(payload)
-        if self.exc:
-            raise self.exc
-        return self.result
+        self.configs.append(config)
+        outcome = self.outcomes[min(len(self.calls), len(self.outcomes)) - 1]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
 
 def _ai(inp, out, cost=None, reasoning=None):
@@ -98,10 +133,11 @@ def test_usage_missing_is_none():
     assert usage.input_tokens is None and usage.cost_usd is None and usage.reasoning_tokens is None
 
 
-def test_analyze_returns_job_analysis(monkeypatch):
+def test_builds_agent_when_none_given(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
     agent = StubAgent({"structured_response": ANALYSIS, "messages": []})
     monkeypatch.setattr(analyzer, "build_analysis_agent", lambda *a: agent)
-    assert analyze(JD, ModelSettings(), "persona", 3) is ANALYSIS
+    assert analyze_with_metadata(JD, ModelSettings(), "persona", 3).analysis is ANALYSIS
 
 
 @pytest.mark.parametrize("jd", ["", "   \n"])
@@ -124,16 +160,103 @@ def test_unknown_prompt_rejected():
         analyze_with_metadata(JD, ModelSettings(), "nope", 3, agent=StubAgent())
 
 
-def test_model_error_is_wrapped():
-    agent = StubAgent(exc=RuntimeError("401 Unauthorized"))
-    with pytest.raises(AnalysisError, match="RuntimeError: 401 Unauthorized"):
+def test_unknown_model_error_is_wrapped():
+    agent = StubAgent(exc=RuntimeError("something odd"))
+    with pytest.raises(AnalysisError, match="request failed: RuntimeError: something odd"):
         analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=agent)
+    assert len(agent.calls) == 1  # request errors are not retried here
 
 
-def test_missing_structured_response_is_error():
+# ---- Missing API key --------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_missing_api_key_is_readable(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("OPENROUTER_API_KEY", value)
+    with pytest.raises(AnalysisError, match="OPENROUTER_API_KEY is not set"):
+        analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3)
+
+
+# ---- Request errors (timeout, invalid model id, ...) ---------------------------
+
+
+def _http_error(status: int, message: str = "error") -> OpenRouterError:
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return OpenRouterError(message, httpx.Response(status, request=request, text=message))
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (httpx.ReadTimeout("read timed out"), "timed out after 45 s"),
+        (_http_error(408), "timed out after 45 s"),
+        (_http_error(401), "rejected the API key"),
+        (_http_error(402), "too few credits"),
+        (_http_error(404), "Model `vendor/does-not-exist` was not found"),
+        (_http_error(400, "vendor/does-not-exist is not a valid model ID"), "not a valid model ID"),
+        (_http_error(429), "Rate limited"),
+        (_http_error(503), "returned an error \\(503\\)"),
+        (httpx.ConnectError("connection refused"), "Could not reach OpenRouter"),
+    ],
+)
+def test_request_errors_are_readable(exc, expected):
+    settings = ModelSettings(model_id="vendor/does-not-exist", timeout=45)
+    with pytest.raises(AnalysisError, match=expected):
+        analyze_with_metadata(JD, settings, "zero_shot", 3, agent=StubAgent(exc=exc))
+
+
+def test_error_messages_never_contain_the_key(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", FAKE_KEY)
+    leaky = _http_error(400, f"bad header Authorization: Bearer {FAKE_KEY}")
+    with pytest.raises(AnalysisError) as info:
+        analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=StubAgent(exc=leaky))
+    assert FAKE_KEY not in str(info.value)
+    assert "[redacted]" in str(info.value)
+
+
+# ---- Schema validation failures: retry once, then error -------------------------
+
+
+def _schema_error() -> StructuredOutputValidationError:
+    return StructuredOutputValidationError(
+        "JobAnalysis", ValueError("missing field 'skills'"), _ai(30, 10, cost=0.001)
+    )
+
+
+def test_schema_failure_is_retried_once_and_succeeds():
+    ok = {"structured_response": ANALYSIS, "messages": [_ai(30, 20, cost=0.002)]}
+    agent = StubAgent(outcomes=[_schema_error(), ok])
+    res = analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=agent)
+    assert res.analysis is ANALYSIS
+    assert len(agent.calls) == 2
+    assert res.usage.attempts == 2
+    assert res.usage.model_calls == 2  # the failed call is counted too
+    assert res.usage.cost_usd == pytest.approx(0.003)
+
+
+def test_schema_failure_twice_raises():
+    agent = StubAgent(exc=_schema_error())
+    with pytest.raises(AnalysisError, match="even after one retry.*missing field"):
+        analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=agent)
+    assert len(agent.calls) == 2
+
+
+def test_missing_structured_response_is_retried_then_error():
     agent = StubAgent({"messages": [AIMessage("plain text")]})
-    with pytest.raises(AnalysisError, match="structured analysis"):
+    with pytest.raises(AnalysisError, match="no structured analysis"):
         analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=agent)
+    assert len(agent.calls) == 2
+
+
+def test_in_graph_retry_exhausted_is_not_retried_again():
+    agent = StubAgent(exc=GraphRecursionError("limit"))
+    with pytest.raises(AnalysisError, match="does not match the schema"):
+        analyze_with_metadata(JD, ModelSettings(), "zero_shot", 3, agent=agent)
+    assert len(agent.calls) == 1
+    assert agent.configs[0] == {"recursion_limit": analyzer.RECURSION_LIMIT}
 
 
 def test_time_budget():
@@ -153,13 +276,16 @@ def test_user_message_neutralises_injected_tags():
 
 def test_build_analysis_agent_uses_structured_output(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    agent = build_analysis_agent(ModelSettings(), "chain_of_thought", 8)
+    agent = build_analysis_agent(build_chat_model(ModelSettings()), "chain_of_thought", 8)
     assert hasattr(agent, "invoke")
 
 
 def test_to_markdown():
     res = analyze_with_metadata(
-        JD, ModelSettings(), "zero_shot", 2,
+        JD,
+        ModelSettings(),
+        "zero_shot",
+        2,
         agent=StubAgent({"structured_response": ANALYSIS, "messages": []}),
     )
     md = to_markdown(res)

@@ -7,8 +7,4 @@ from langchain_streamlit_app.schemas import (
     StudyPlanItem,
 )
 
-__all__ = ["InterviewTopic", "JobAnalysis", "Skill", "StudyPlanItem", "main"]
-
-
-def main() -> None:
-    print("Hello from langchain-streamlit-app!")
+__all__ = ["InterviewTopic", "JobAnalysis", "Skill", "StudyPlanItem"]

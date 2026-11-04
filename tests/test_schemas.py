@@ -56,6 +56,24 @@ def test_sample_job_analysis_validates():
 
 
 def test_too_few_example_questions_is_rejected():
-    bad = {**SAMPLE, "interview_topics": [{**SAMPLE["interview_topics"][0], "example_questions": ["Only one?"]}]}
+    bad = {
+        **SAMPLE,
+        "interview_topics": [{**SAMPLE["interview_topics"][0], "example_questions": ["Only one?"]}],
+    }
     with pytest.raises(ValidationError):
         JobAnalysis.model_validate(bad)
+
+
+def test_skill_mentioned_label():
+    from langchain_streamlit_app import Skill
+
+    base = {
+        "name": "SQL",
+        "category": "technical",
+        "priority": "must-have",
+        "proficiency": "fluent",
+        "evidence": "SQL",
+    }
+    assert Skill(**base).mentioned == "Explicit"
+    assert Skill(**base, inferred=True).mentioned == "Implied"
+    assert "mentioned" not in Skill.model_json_schema()["properties"]

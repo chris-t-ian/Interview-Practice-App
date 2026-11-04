@@ -68,8 +68,7 @@ def _strip_invisible(text: str) -> str:
     return "".join(
         ch
         for ch in text
-        if ch in "\n\t"
-        or unicodedata.category(ch) not in ("Cf", "Cc", "Co", "Cs")
+        if ch in "\n\t" or unicodedata.category(ch) not in ("Cf", "Cc", "Co", "Cs")
     )
 
 
@@ -110,19 +109,24 @@ def sanitize(text: str) -> str:
 # phrases such as "act as a point of contact", "you are now part of the team" or
 # "experience writing system prompts" must NOT match.
 
-_W = r"(?:[\w'’-]+ ){0,3}"  # up to three filler words
+_FILLER_WORDS = r"(?:[\w'’-]+ ){0,3}"  # up to three filler words
 
-_TARGETS_EN = r"(?:instructions?|prompts?|rules|guidelines|directives|directions|commands|context|constraints)"
-_TARGETS_DE = r"(?:anweisungen|instruktionen|regeln|vorgaben|befehle|richtlinien|prompts?|anordnungen)"
+_TARGETS_EN = (
+    r"(?:instructions?|prompts?|rules|guidelines|directives|directions|commands|context|"
+    r"constraints)"
+)
+_TARGETS_DE = (
+    r"(?:anweisungen|instruktionen|regeln|vorgaben|befehle|richtlinien|prompts?|anordnungen)"
+)
 
 _INJECTION_RULES: list[tuple[str, str, re.Pattern[str]]] = [
     (
         "ignore_instructions",
         "Asks the model to ignore/forget its previous instructions",
         re.compile(
-            r"\b(?:ignore|disregard|forget) (?:" + _W + r")?"
+            r"\b(?:ignore|disregard|forget) (?:" + _FILLER_WORDS + r")?"
             r"(?:all|your|these|those|previous|prior|above|earlier|preceding|"
-            r"foregoing|initial|original|system)\b ?" + _W + _TARGETS_EN + r"\b"
+            r"foregoing|initial|original|system)\b ?" + _FILLER_WORDS + _TARGETS_EN + r"\b"
         ),
     ),
     (
@@ -130,9 +134,12 @@ _INJECTION_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Fordert das Modell auf, bisherige Anweisungen zu ignorieren",
         re.compile(
             r"\b(?:ignorier(?:e|en|t)?|vergiss|vergesst|vergessen sie|missachte(?:n)?|"
-            r"übergeh(?:e|en)?|überschreib(?:e|en)?) (?:" + _W + r")?"
+            r"übergeh(?:e|en)?|überschreib(?:e|en)?) (?:" + _FILLER_WORDS + r")?"
             r"(?:alle|sämtliche|deine|eure|vorherigen?|bisherigen?|obigen?|"
-            r"vorangegangenen?|früheren?|ursprünglichen?|system)\b ?" + _W + _TARGETS_DE + r"\b"
+            r"vorangegangenen?|früheren?|ursprünglichen?|system)\b ?"
+            + _FILLER_WORDS
+            + _TARGETS_DE
+            + r"\b"
         ),
     ),
     (
@@ -185,9 +192,11 @@ _INJECTION_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Fordert Rollenspiel als etwas anderes",
         re.compile(
             r"\b(?:tu|tue|tun sie) so,? als (?:ob du|wärst du|ob sie|wären sie|seist du)\b"
-            r"|\bhandle als (?:ein(?:e)? )?(?:uneingeschränkte|andere|neue)?\s?(?:ki|assistent|modell|bot)\b"
+            r"|\bhandle als (?:ein(?:e)? )?(?:uneingeschränkte|andere|neue)?\s?"
+            r"(?:ki|assistent|modell|bot)\b"
             r"|\bgib dich als .{0,40} aus\b"
-            r"|\bspiele? die rolle (?:eine[sr]?|des|der) .{0,30}(?:ki|assistent|modell|bot|hacker)\b"
+            r"|\bspiele? die rolle (?:eine[sr]?|des|der) .{0,30}"
+            r"(?:ki|assistent|modell|bot|hacker)\b"
         ),
     ),
     (
@@ -195,11 +204,14 @@ _INJECTION_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Asks the model to reveal its system prompt or instructions",
         re.compile(
             r"\b(?:reveal|print|show|display|output|repeat|leak|dump|disclose|expose|recite|"
-            r"tell me|give me|write out|spell out|what (?:is|are|were)) (?:me |us )?" + _W
+            r"tell me|give me|write out|spell out|what (?:is|are|were)) (?:me |us )?"
+            + _FILLER_WORDS
             + r"(?:your|thy) (?:system prompt|system message|initial prompt|hidden prompt|"
             r"original prompt|instructions|prompt)\b"
             r"|\b(?:reveal|print|repeat|leak|dump|disclose|expose|recite|output) (?:me |us )?"
-            r"(?:" + _W + r")?(?:the |this )?(?:above |previous |hidden |secret |initial |original )?"
+            r"(?:"
+            + _FILLER_WORDS
+            + r")?(?:the |this )?(?:above |previous |hidden |secret |initial |original )?"
             r"(?:system prompt|system message|initial prompt|hidden prompt|original prompt|"
             r"(?:above|hidden|secret|initial|original) instructions)\b"
             r"|\b(?:everything|all text|the text|all) (?:above|before) (?:this|these) "
@@ -211,7 +223,8 @@ _INJECTION_RULES: list[tuple[str, str, re.Pattern[str]]] = [
         "Fordert das Modell auf, seinen Systemprompt preiszugeben",
         re.compile(
             r"\b(?:zeig(?:e|en sie)?|gib|nenne?|verrate?|wiederhole?|druck(?:e)?|enthülle?) "
-            r"(?:mir |uns )?" + _W
+            r"(?:mir |uns )?"
+            + _FILLER_WORDS
             + r"(?:deine[n]?|ihre[n]?|den|die (?:geheimen|versteckten|ursprünglichen|obigen|"
             r"vorherigen)) (?:system[- ]?prompts?|system[- ]?nachricht|anweisungen|instruktionen|"
             r"regeln|vorgaben|prompts?)\b"
@@ -269,14 +282,45 @@ def detect_injection(text: str) -> InjectionMatch | None:
 # ("Berufserfahrung", "Anforderungsprofil") count too.
 JD_KEYWORDS = (
     # English
-    "responsibilit", "requirement", "experience", "qualification", "skills",
-    "you will", "what you'll", "we offer", "benefits", "about the role", "about you",
-    "degree", "candidate", "apply", "salary", "full-time", "part-time", "position",
-    "nice to have", "must have", "job description",
+    "responsibilit",
+    "requirement",
+    "experience",
+    "qualification",
+    "skills",
+    "you will",
+    "what you'll",
+    "we offer",
+    "benefits",
+    "about the role",
+    "about you",
+    "degree",
+    "candidate",
+    "apply",
+    "salary",
+    "full-time",
+    "part-time",
+    "position",
+    "nice to have",
+    "must have",
+    "job description",
     # German
-    "aufgaben", "anforderung", "erfahrung", "qualifikation", "kenntnisse", "profil",
-    "wir bieten", "bewerb", "stelle", "studium", "ausbildung", "(m/w/d)", "vollzeit",
-    "teilzeit", "verantwortung", "das bringst du mit", "was dich erwartet",
+    "aufgaben",
+    "anforderung",
+    "erfahrung",
+    "qualifikation",
+    "kenntnisse",
+    "profil",
+    "wir bieten",
+    "bewerb",
+    "stelle",
+    "studium",
+    "ausbildung",
+    "(m/w/d)",
+    "vollzeit",
+    "teilzeit",
+    "verantwortung",
+    "das bringst du mit",
+    "was dich erwartet",
 )
 
 

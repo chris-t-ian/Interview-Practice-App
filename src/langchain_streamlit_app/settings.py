@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field
 
 DEFAULT_MODEL_ID = "openai/gpt-6-luna"
+API_KEY_ENV = "OPENROUTER_API_KEY"
+MODEL_ENV = "OPENROUTER_MODEL"
+REDACTED = "[redacted]"
 
 # Curated OpenRouter model ids for the sidebar selectbox (verified against the
 # public OpenRouter model list). The first entry is the default.
@@ -85,7 +88,7 @@ def load_env() -> None:
 
 def default_model_id() -> str:
     """Model id from `OPENROUTER_MODEL`, falling back to the built-in default."""
-    return os.getenv("OPENROUTER_MODEL", "").strip() or DEFAULT_MODEL_ID
+    return os.getenv(MODEL_ENV, "").strip() or DEFAULT_MODEL_ID
 
 
 def default_settings() -> ModelSettings:
@@ -94,8 +97,24 @@ def default_settings() -> ModelSettings:
 
 
 def has_api_key() -> bool:
-    """Whether `OPENROUTER_API_KEY` is set (without exposing its value)."""
-    return bool(os.getenv("OPENROUTER_API_KEY"))
+    """Whether `OPENROUTER_API_KEY` is set and non-blank (without exposing its value)."""
+    return bool(os.getenv(API_KEY_ENV, "").strip())
+
+
+# OpenRouter keys start with "sk-or-"; redact anything shaped like one, too.
+_KEY_SHAPE = re.compile(r"sk-or-[\w-]{8,}")
+
+
+def redact_secrets(text: str) -> str:
+    """Remove the API key (and anything shaped like an OpenRouter key) from `text`.
+
+    Applied to every error message before it is shown, as a safety net in case
+    an exception message ever echoes request details.
+    """
+    key = os.getenv(API_KEY_ENV, "").strip()
+    if key:
+        text = text.replace(key, REDACTED)
+    return _KEY_SHAPE.sub(REDACTED, text)
 
 
 def may_ignore_sampling(model_id: str) -> bool:

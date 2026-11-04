@@ -1,4 +1,4 @@
-"""Analysis pipeline: prompt -> model -> parsed `JobAnalysis`.
+"""Analysis pipeline: guards -> prompt -> model -> parsed `JobAnalysis`.
 
 No Streamlit imports, so this module can be tested on its own. The content
 guards (guards.py) run at the start of `analyze_with_metadata`, before the agent
@@ -6,28 +6,53 @@ is built or called; only the sanitised text reaches the model.
 
 The UI caches the agent itself (see `build_analysis_agent`) and passes it in;
 without an agent argument, a fresh one is built for each call.
+
+Every error leaves this module as an `AnalysisError` with a readable message
+that has been passed through `redact_secrets`.
 """
 
 import time
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+from langchain.agents.structured_output import StructuredOutputError
 from langchain_core.messages import AIMessage
+from langchain_openrouter import ChatOpenRouter
+from langgraph.errors import GraphRecursionError
+from openrouter.errors import NoResponseError
 
 from langchain_streamlit_app.guards import GuardResult, run_guards
-from langchain_streamlit_app.llm import build_agent, build_chat_model
+from langchain_streamlit_app.llm import Agent, build_agent, build_chat_model
 from langchain_streamlit_app.prompts import (
     MAX_TIME_BUDGET_HOURS,
     get_prompt,
+    render_system_prompt,
     wrap_job_description,
 )
 from langchain_streamlit_app.schemas import JobAnalysis
-from langchain_streamlit_app.settings import ModelSettings
+from langchain_streamlit_app.settings import (
+    API_KEY_ENV,
+    ModelSettings,
+    has_api_key,
+    redact_secrets,
+)
 
 DEFAULT_HOURS_PER_DAY = 2.0
 DEFAULT_STUDY_DAYS = 7
 MIN_STUDY_DAYS = 1
 MAX_STUDY_DAYS = 60
+
+# Structured output fails -> retry once. LangChain picks the strategy per model:
+# - provider-native JSON schema: a parse failure raises `StructuredOutputError`,
+#   and we retry once ourselves (SCHEMA_ATTEMPTS).
+# - tool-call fallback: LangChain retries inside the graph. A run whose N-th
+#   model call succeeds needs N + 1 graph steps, so a limit of 3 allows exactly
+#   one in-graph retry; hitting it raises `GraphRecursionError`, which we treat
+#   as final (the retry has already happened).
+SCHEMA_ATTEMPTS = 2
+RECURSION_LIMIT = 3
+MAX_ERROR_DETAIL_CHARS = 300
 
 
 class AnalysisError(Exception):
@@ -37,7 +62,7 @@ class AnalysisError(Exception):
 class InputRejected(AnalysisError):
     """The input guards blocked the job description; `guard` says which rule fired."""
 
-    def __init__(self, guard: GuardResult):
+    def __init__(self, guard: GuardResult) -> None:
         super().__init__(guard.reason or "The job description was rejected.")
         self.guard = guard
 
@@ -55,6 +80,7 @@ class UsageInfo:
     model_name: str | None = None
     provider: str | None = None
     model_calls: int = 0
+    attempts: int = 1
 
 
 @dataclass(frozen=True)
@@ -89,11 +115,14 @@ def build_user_message(jd: str, study_days: int, time_budget_hours: float) -> st
     )
 
 
-def build_analysis_agent(settings: ModelSettings, prompt_key: str, time_budget_hours: float):
+def build_analysis_agent(
+    chat_model: ChatOpenRouter, prompt_key: str, time_budget_hours: float
+) -> Agent:
     """Agent with the rendered system prompt and `JobAnalysis` as structured output."""
-    system_prompt = get_prompt(prompt_key).render(time_budget_hours)
     return build_agent(
-        build_chat_model(settings), system_prompt=system_prompt, response_format=JobAnalysis
+        chat_model,
+        system_prompt=render_system_prompt(prompt_key, time_budget_hours),
+        response_format=JobAnalysis,
     )
 
 
@@ -104,12 +133,13 @@ def analyze_with_metadata(
     study_days: int,
     *,
     hours_per_day: float = DEFAULT_HOURS_PER_DAY,
-    agent: Any = None,
+    agent: Agent | None = None,
 ) -> AnalysisResult:
     """Run the full pipeline and return the analysis with usage/latency metadata.
 
-    Raises `InputRejected` if a guard blocks the JD and `AnalysisError` with a
-    readable message on any other failure.
+    If the model's output does not match the schema, the request is retried
+    once. Raises `InputRejected` if a guard blocks the JD and `AnalysisError`
+    with a readable (secret-free) message on any other failure.
     """
     guard = run_guards(jd)
     if not guard.ok:
@@ -122,37 +152,92 @@ def analyze_with_metadata(
     hours = time_budget_for(study_days, hours_per_day)
 
     if agent is None:
-        agent = build_analysis_agent(settings, prompt_key, hours)
+        agent = build_analysis_agent(_build_chat_model_or_raise(settings), prompt_key, hours)
 
-    message = build_user_message(jd, study_days, hours)
+    payload = {"messages": [{"role": "user", "content": build_user_message(jd, study_days, hours)}]}
+    messages: list[Any] = []  # all messages over all attempts, for usage/cost
+    problem = ""
     start = time.perf_counter()
-    try:
-        result = agent.invoke({"messages": [{"role": "user", "content": message}]})
-    except Exception as exc:
-        raise AnalysisError(f"The model request failed: {_describe(exc)}") from exc
-    latency = time.perf_counter() - start
+    for attempt in range(1, SCHEMA_ATTEMPTS + 1):
+        try:
+            result = agent.invoke(payload, config={"recursion_limit": RECURSION_LIMIT})
+        except StructuredOutputError as exc:
+            messages.append(exc.ai_message)
+            problem = str(exc)
+            continue
+        except GraphRecursionError:
+            problem = "the model repeatedly returned output that does not match the schema"
+            break
+        except Exception as exc:
+            raise AnalysisError(describe_request_error(exc, settings)) from exc
+        messages.extend(result.get("messages", []))
+        analysis = result.get("structured_response")
+        if isinstance(analysis, JobAnalysis):
+            return AnalysisResult(
+                analysis=analysis,
+                usage=collect_usage(messages, time.perf_counter() - start, attempts=attempt),
+                prompt_key=prompt_key,
+                study_days=study_days,
+                time_budget_hours=hours,
+            )
+        problem = "the response contained no structured analysis"
 
-    analysis = result.get("structured_response")
-    if not isinstance(analysis, JobAnalysis):
-        raise AnalysisError(
-            "The model did not return a structured analysis. Try again, raise max tokens, "
-            "or pick a model that supports structured output."
-        )
-    return AnalysisResult(
-        analysis=analysis,
-        usage=collect_usage(result.get("messages", []), latency),
-        prompt_key=prompt_key,
-        study_days=study_days,
-        time_budget_hours=hours,
+    raise AnalysisError(
+        "The model's output did not match the expected format, even after one retry "
+        f"({_shorten(redact_secrets(problem))}). Try again, raise max tokens, or pick a "
+        "model that supports structured output."
     )
 
 
-def analyze(jd: str, settings: ModelSettings, prompt_key: str, study_days: int) -> JobAnalysis:
-    """Analyse a job description and return only the parsed `JobAnalysis`."""
-    return analyze_with_metadata(jd, settings, prompt_key, study_days).analysis
+def _build_chat_model_or_raise(settings: ModelSettings) -> ChatOpenRouter:
+    """Build the chat model, turning a missing key or bad setting into `AnalysisError`."""
+    if not has_api_key():
+        raise AnalysisError(f"{API_KEY_ENV} is not set. Add it to your .env file.")
+    try:
+        return build_chat_model(settings)
+    except ValueError as exc:
+        raise AnalysisError(
+            f"Could not build the model: {redact_secrets(_format_exception(exc))}"
+        ) from exc
 
 
-def collect_usage(messages: list[Any], latency_s: float) -> UsageInfo:
+def describe_request_error(exc: BaseException, settings: ModelSettings) -> str:
+    """User-facing message for a failed model request (secrets redacted)."""
+    status = getattr(exc, "status_code", None)
+    detail = _shorten(_format_exception(exc))
+    if isinstance(exc, httpx.TimeoutException) or status in (408, 524):
+        message = (
+            f"The model request timed out after {settings.timeout} s. Raise the timeout in "
+            "the sidebar, lower max tokens, or try a faster model."
+        )
+    elif status == 401:
+        message = f"OpenRouter rejected the API key (401). Check {API_KEY_ENV} in your .env file."
+    elif status == 402:
+        message = "Your OpenRouter account has too few credits for this request (402)."
+    elif status == 404:
+        message = (
+            f"Model `{settings.model_id}` was not found on OpenRouter (404). Check the model id."
+        )
+    elif status == 400:
+        message = (
+            f"OpenRouter rejected the request (400): {detail}. Check the model id and "
+            "whether the model supports the chosen settings."
+        )
+    elif status == 429:
+        message = "Rate limited by OpenRouter or the model provider (429). Wait a moment and retry."
+    elif isinstance(status, int) and status >= 500:
+        message = (
+            f"OpenRouter or the model provider returned an error ({status}). "
+            "Try again or pick another model."
+        )
+    elif isinstance(exc, (httpx.NetworkError, NoResponseError)):
+        message = "Could not reach OpenRouter. Check your internet connection and try again."
+    else:
+        message = f"The model request failed: {detail}"
+    return redact_secrets(message)
+
+
+def collect_usage(messages: list[Any], latency_s: float, *, attempts: int = 1) -> UsageInfo:
     """Sum token usage and cost over all model calls in the run."""
     ai_messages = [m for m in messages if isinstance(m, AIMessage)]
     totals: dict[str, int] = {}
@@ -183,12 +268,18 @@ def collect_usage(messages: list[Any], latency_s: float) -> UsageInfo:
         model_name=last_meta.get("model_name"),
         provider=last_meta.get("provider"),
         model_calls=len(ai_messages),
+        attempts=attempts,
     )
 
 
-def _describe(exc: Exception) -> str:
+def _format_exception(exc: BaseException) -> str:
     text = str(exc).strip()
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+def _shorten(text: str, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 # --------------------------------------------------------------------------
@@ -197,47 +288,48 @@ def _describe(exc: Exception) -> str:
 
 
 def total_study_hours(analysis: JobAnalysis) -> float:
+    """Sum of `estimated_hours` over the study plan."""
     return sum(item.estimated_hours for item in analysis.study_plan)
 
 
 def to_markdown(result: AnalysisResult) -> str:
     """Render the analysis as a Markdown report."""
-    a = result.analysis
+    analysis = result.analysis
     lines = [
-        f"# Interview prep: {a.role_title}",
+        f"# Interview prep: {analysis.role_title}",
         "",
-        f"- Seniority: {a.seniority}",
+        f"- Seniority: {analysis.seniority}",
         f"- Interview in: {result.study_days} day(s)",
         f"- Study budget: {result.time_budget_hours:g} h "
-        f"(planned: {total_study_hours(a):g} h)",
+        f"(planned: {total_study_hours(analysis):g} h)",
         "",
         "## Key skills",
         "",
         "| Skill | Category | Priority | Proficiency | How it's mentioned | Evidence |",
         "|---|---|---|---|---|---|",
     ]
-    for s in a.skills:
-        mentioned = "Implied" if s.inferred else "Explicit"
+    for skill in analysis.skills:
         lines.append(
-            f"| {_cell(s.name)} | {s.category} | {s.priority} | {s.proficiency} | {mentioned} "
-            f"| {_cell(s.evidence)} |"
+            f"| {_cell(skill.name)} | {skill.category} | {skill.priority} | "
+            f"{skill.proficiency} | {skill.mentioned} | {_cell(skill.evidence)} |"
         )
     lines += ["", "## Likely interview topics", ""]
-    for t in a.interview_topics:
-        lines += [f"### {t.topic} ({t.difficulty})", "", t.why_likely, ""]
-        lines += [f"{i}. {q}" for i, q in enumerate(t.example_questions, start=1)]
+    for topic in analysis.interview_topics:
+        lines += [f"### {topic.topic} ({topic.difficulty})", "", topic.why_likely, ""]
+        lines += [f"{n}. {q}" for n, q in enumerate(topic.example_questions, start=1)]
         lines.append("")
     lines += ["## Study plan", ""]
-    for item in a.study_plan:
+    for item in analysis.study_plan:
         lines += [f"### {item.day_or_block}: {item.focus} ({item.estimated_hours:g} h)", ""]
         lines += [f"- {act}" for act in item.activities]
         if item.resources:
             lines.append(f"- Resources: {', '.join(item.resources)}")
         lines.append("")
-    if a.reasoning:
-        lines += ["## Reasoning", "", a.reasoning, ""]
+    if analysis.reasoning:
+        lines += ["## Reasoning", "", analysis.reasoning, ""]
     return "\n".join(lines).rstrip() + "\n"
 
 
 def _cell(text: str) -> str:
+    """Escape text for a Markdown table cell."""
     return text.replace("|", "\\|").replace("\n", " ")

@@ -10,13 +10,17 @@ from typing import Any
 
 from langchain.agents import create_agent
 from langchain_openrouter import ChatOpenRouter
+from langgraph.graph.state import CompiledStateGraph
 
 from langchain_streamlit_app.settings import ModelSettings
 
-# Placeholder until the prompt registry (prompts.py) exists.
-DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Answer clearly and concisely."
+# Retries of the OpenRouter SDK on 5xx and connection errors. Each retry adds
+# up to ~150 s of backoff (SDK default is 2), so keep it low: otherwise the
+# total wait is far longer than the per-request timeout the user sets.
+MAX_RETRIES = 1
 
-# ChatOpenRouter fields shown as the "effective config" in the UI.
+# ChatOpenRouter fields shown as the "effective config" in the UI. An explicit
+# allow-list, so the API key can never end up in it.
 _EFFECTIVE_FIELDS = (
     "model_name",
     "temperature",
@@ -29,9 +33,15 @@ _EFFECTIVE_FIELDS = (
     "max_retries",
 )
 
+# Type of the compiled agent returned by `create_agent`.
+Agent = CompiledStateGraph
+
 
 def build_chat_model(settings: ModelSettings) -> ChatOpenRouter:
-    """Create a ChatOpenRouter instance. Reads `OPENROUTER_API_KEY` from the env."""
+    """Create a ChatOpenRouter instance. Reads `OPENROUTER_API_KEY` from the env.
+
+    Raises `ValueError` if the key is not set.
+    """
     return ChatOpenRouter(
         model=settings.model_id,
         temperature=settings.temperature,
@@ -41,14 +51,15 @@ def build_chat_model(settings: ModelSettings) -> ChatOpenRouter:
         presence_penalty=settings.presence_penalty,
         seed=settings.seed,
         timeout=settings.timeout * 1000,  # seconds -> milliseconds
+        max_retries=MAX_RETRIES,
     )
 
 
 def build_agent(
     chat_model: ChatOpenRouter,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-    response_format: Any = None,
-):
+    system_prompt: str,
+    response_format: type[Any] | None = None,
+) -> Agent:
     """Create a tool-less agent around the given chat model.
 
     With `response_format` (e.g. a Pydantic model) the agent returns the parsed

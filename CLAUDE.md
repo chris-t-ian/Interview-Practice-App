@@ -42,7 +42,7 @@ Features:
 # Conventions
 
 - Dependencies are pinned to exact versions in `pyproject.toml`. Add new ones with `uv add <pkg>==<version>` so `uv.lock` stays in sync.
-- Models are passed as `openrouter:<model-id>` strings to `create_agent` (needs `langchain-openrouter`).
+- Models are built as `ChatOpenRouter` instances (from `langchain-openrouter`) in `llm.py` and passed to `create_agent`, so every sidebar setting is passed explicitly. Don't switch to `openrouter:<model-id>` strings.
 - Cache the agent with `@st.cache_resource`, keyed on the model settings and the selected prompt, so changing a setting builds a new agent. Show errors in the UI with `st.error`.
 - Keep Streamlit code in `streamlit_app.py`. Package modules don't import `streamlit`.
 - Use the LangChain and Streamlit skills in `.claude/skills/` when changing LangChain or Streamlit code.

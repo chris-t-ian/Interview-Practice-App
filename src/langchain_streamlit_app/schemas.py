@@ -28,7 +28,9 @@ class Skill(BaseModel):
         )
     )
     priority: SkillPriority = Field(
-        description="'must-have' if the JD requires it, 'nice-to-have' if it is a plus or preferred."
+        description=(
+            "'must-have' if the JD requires it, 'nice-to-have' if it is a plus or preferred."
+        )
     )
     proficiency: Proficiency = Field(
         description=(
@@ -52,6 +54,11 @@ class Skill(BaseModel):
             "(e.g. 'REST APIs' implied by 'build backend services')."
         ),
     )
+
+    @property
+    def mentioned(self) -> Literal["Explicit", "Implied"]:
+        """Display label for `inferred` (not part of the schema sent to the model)."""
+        return "Implied" if self.inferred else "Explicit"
 
 
 class InterviewTopic(BaseModel):

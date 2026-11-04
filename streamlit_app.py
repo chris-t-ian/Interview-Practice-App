@@ -9,9 +9,11 @@ import re
 
 import pandas as pd
 import streamlit as st
+from langchain_openrouter import ChatOpenRouter
+from pandas.io.formats.style import Styler
 from pydantic import ValidationError
 
-from langchain_streamlit_app import settings as cfg
+from langchain_streamlit_app import settings as app_config
 from langchain_streamlit_app.analyzer import (
     DEFAULT_HOURS_PER_DAY,
     DEFAULT_STUDY_DAYS,
@@ -32,19 +34,20 @@ from langchain_streamlit_app.guards import (
     record_request,
     run_guards,
 )
-from langchain_streamlit_app.llm import build_chat_model, effective_config
+from langchain_streamlit_app.llm import Agent, build_chat_model, effective_config
 from langchain_streamlit_app.prompts import DEFAULT_PROMPT_KEY, PROMPTS
-from langchain_streamlit_app.settings import ModelSettings
+from langchain_streamlit_app.schemas import Skill
+from langchain_streamlit_app.settings import ModelSettings, redact_secrets
 
 st.set_page_config(
     page_title="Job description analyser", page_icon=":material/work:", layout="wide"
 )
 
 # Loads OPENROUTER_API_KEY (and optionally OPENROUTER_MODEL) from .env.
-cfg.load_env()
+app_config.load_env()
 
-DEFAULTS = cfg.default_settings()
-MODEL_OPTIONS = list(dict.fromkeys([DEFAULTS.model_id, *cfg.CURATED_MODELS]))
+DEFAULTS = app_config.default_settings()
+MODEL_OPTIONS = list(dict.fromkeys([DEFAULTS.model_id, *app_config.CURATED_MODELS]))
 
 # Session-state key for each settings widget, with its default value.
 WIDGET_DEFAULTS = {
@@ -79,15 +82,16 @@ def _settings_key(settings: ModelSettings) -> str:
     return settings.model_dump_json()
 
 
-# One chat model / agent per distinct (settings, prompt, time budget).
+# One chat model per distinct settings; one agent per (settings, prompt, time
+# budget). The agent reuses the cached chat model instead of building its own.
 @st.cache_resource(max_entries=16, hash_funcs={ModelSettings: _settings_key})
-def get_chat_model(settings: ModelSettings):
+def get_chat_model(settings: ModelSettings) -> ChatOpenRouter:
     return build_chat_model(settings)
 
 
 @st.cache_resource(max_entries=16, hash_funcs={ModelSettings: _settings_key})
-def get_analysis_agent(settings: ModelSettings, prompt_key: str, time_budget_hours: float):
-    return build_analysis_agent(settings, prompt_key, time_budget_hours)
+def get_analysis_agent(settings: ModelSettings, prompt_key: str, time_budget_hours: float) -> Agent:
+    return build_analysis_agent(get_chat_model(settings), prompt_key, time_budget_hours)
 
 
 # ---- Sidebar: prompt technique + model settings -----------------------------
@@ -99,8 +103,8 @@ with st.sidebar:
         key="prompt_key",
         format_func=lambda k: PROMPTS[k].name,
     )
-    spec = PROMPTS[prompt_key]
-    st.caption(f"**{spec.technique}**: {spec.description}")
+    selected_spec = PROMPTS[prompt_key]
+    st.caption(f"**{selected_spec.technique}**: {selected_spec.description}")
 
     st.header("Model settings")
     st.selectbox(
@@ -119,48 +123,48 @@ with st.sidebar:
 
     st.slider(
         "Temperature",
-        min_value=cfg.TEMPERATURE.min,
-        max_value=cfg.TEMPERATURE.max,
-        step=cfg.TEMPERATURE.step,
+        min_value=app_config.TEMPERATURE.min,
+        max_value=app_config.TEMPERATURE.max,
+        step=app_config.TEMPERATURE.step,
         key="s_temperature",
         help="Higher = more varied output, lower = more focused and deterministic.",
     )
     st.slider(
         "Top p",
-        min_value=cfg.TOP_P.min,
-        max_value=cfg.TOP_P.max,
-        step=cfg.TOP_P.step,
+        min_value=app_config.TOP_P.min,
+        max_value=app_config.TOP_P.max,
+        step=app_config.TOP_P.step,
         key="s_top_p",
         help="Nucleus sampling: only sample from the most likely tokens whose "
         "probabilities add up to this value. Usually tune this or temperature, not both.",
     )
-    if cfg.may_ignore_sampling(model_id):
+    if app_config.may_ignore_sampling(model_id):
         st.caption(
             ":material/info: This looks like a reasoning model; it may ignore "
             "temperature and top p."
         )
     st.number_input(
         "Max tokens",
-        min_value=int(cfg.MAX_TOKENS.min),
-        max_value=int(cfg.MAX_TOKENS.max),
-        step=int(cfg.MAX_TOKENS.step),
+        min_value=int(app_config.MAX_TOKENS.min),
+        max_value=int(app_config.MAX_TOKENS.max),
+        step=int(app_config.MAX_TOKENS.step),
         key="s_max_tokens",
         help="Upper limit on generated tokens. For reasoning models this also "
         "covers the hidden reasoning tokens.",
     )
     st.slider(
         "Frequency penalty",
-        min_value=cfg.PENALTY.min,
-        max_value=cfg.PENALTY.max,
-        step=cfg.PENALTY.step,
+        min_value=app_config.PENALTY.min,
+        max_value=app_config.PENALTY.max,
+        step=app_config.PENALTY.step,
         key="s_frequency_penalty",
         help="Positive values discourage repeating the same tokens often.",
     )
     st.slider(
         "Presence penalty",
-        min_value=cfg.PENALTY.min,
-        max_value=cfg.PENALTY.max,
-        step=cfg.PENALTY.step,
+        min_value=app_config.PENALTY.min,
+        max_value=app_config.PENALTY.max,
+        step=app_config.PENALTY.step,
         key="s_presence_penalty",
         help="Positive values encourage introducing new topics.",
     )
@@ -175,11 +179,12 @@ with st.sidebar:
     )
     st.slider(
         "Timeout (seconds)",
-        min_value=int(cfg.TIMEOUT_S.min),
-        max_value=int(cfg.TIMEOUT_S.max),
-        step=int(cfg.TIMEOUT_S.step),
+        min_value=int(app_config.TIMEOUT_S.min),
+        max_value=int(app_config.TIMEOUT_S.max),
+        step=int(app_config.TIMEOUT_S.step),
         key="s_timeout",
-        help="How long to wait for a single model request.",
+        help="How long to wait for a single model request. On server or connection "
+        "errors the request is retried once, so the total wait can be longer.",
     )
     st.button(
         "Reset to defaults",
@@ -208,22 +213,24 @@ with st.sidebar:
 st.title("Job description analyser")
 st.caption(
     f"Paste a job description to get key skills, likely interview topics and a study plan. "
-    f"Model: `{settings.model_id}` via OpenRouter · Prompt: {spec.name}"
+    f"Model: `{settings.model_id}` via OpenRouter · Prompt: {selected_spec.name}"
 )
 
-if not cfg.has_api_key():
-    st.error("Add `OPENROUTER_API_KEY` to your `.env` file.", title="Missing API key")
+if not app_config.has_api_key():
+    st.error(
+        f"Add `{app_config.API_KEY_ENV}` to your `.env` file and restart the app.",
+        title="Missing API key",
+    )
     st.stop()
 
 try:
     chat_model = get_chat_model(settings)
 except Exception as exc:  # e.g. invalid parameters rejected by ChatOpenRouter
-    st.error(str(exc), title="Could not build the model")
+    st.error(redact_secrets(f"{type(exc).__name__}: {exc}"), title="Could not build the model")
     st.stop()
 
 with st.sidebar.expander("Effective config", icon=":material/tune:"):
     st.json(effective_config(chat_model))
-
 
 
 def collapse_jd_input() -> None:
@@ -232,17 +239,28 @@ def collapse_jd_input() -> None:
         st.session_state.jd_expander = False
 
 
-def jd_expander_label() -> str:
+_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>()#+!|~:$])")
+
+
+def _md_escape(text: str) -> str:
+    """Escape Markdown so text renders literally (no links, images, directives)."""
+    return _MD_SPECIAL.sub(r"\\\1", text.replace("\n", " "))
+
+
+def jd_preview() -> str | None:
+    """First line of the JD (shortened), shown while the input is collapsed."""
     jd = st.session_state.get("jd_text", "").strip()
     if st.session_state.jd_expander or not jd:
-        return "Job description"
+        return None
     first_line = jd.splitlines()[0]
-    preview = first_line if len(first_line) <= 80 else first_line[:80].rstrip() + "…"
-    return f"Job description: {preview}"
+    return first_line if len(first_line) <= 80 else first_line[:80].rstrip() + "…"
 
 
+# The label must stay constant: Streamlit derives the expander's widget id from
+# its label, so a label that changes with the open state creates a new widget
+# on every toggle (it then snaps shut and needs a second click).
 with st.expander(
-    jd_expander_label(), key="jd_expander", on_change="rerun", icon=":material/description:"
+    "Job description", key="jd_expander", on_change="rerun", icon=":material/description:"
 ):
     with st.form("jd_form", border=False):
         jd_text = st.text_area(
@@ -263,6 +281,9 @@ with st.expander(
         submitted = st.form_submit_button(
             "Analyse", icon=":material/search:", type="primary", on_click=collapse_jd_input
         )
+if preview := jd_preview():
+    st.caption(f":material/subdirectory_arrow_right: {_md_escape(preview)}")
+
 
 def show_blocked(guard: GuardResult, title: str) -> None:
     st.error(guard.reason, title=title, icon=":material/block:")
@@ -270,7 +291,10 @@ def show_blocked(guard: GuardResult, title: str) -> None:
 
 
 if submitted:
-    # Guards run before any agent is built or model is called.
+    # Guards run before any agent is built or model is called. They run here (for
+    # the warnings and to skip building an agent for bad input), in the collapse
+    # callback above, and again inside `analyze_with_metadata`, which is the
+    # authoritative check. The repeats are cheap and keep the analyzer safe on its own.
     rate = check_rate_limit(st.session_state.analysis_times)
     guard = run_guards(jd_text)
     if not rate.ok:
@@ -286,7 +310,7 @@ if submitted:
             hours = time_budget_for(int(study_days))
             agent = get_analysis_agent(settings, prompt_key, hours)
             record_request(st.session_state.analysis_times)
-            with st.spinner(f"Analysing with {spec.name}…"):
+            with st.spinner(f"Analysing with {selected_spec.name}…"):
                 st.session_state.last_result = analyze_with_metadata(
                     guard.sanitized_text, settings, prompt_key, int(study_days), agent=agent
                 )
@@ -301,7 +325,7 @@ if submitted:
             st.error(str(exc), title="Analysis failed")
         except Exception as exc:  # anything unexpected, e.g. while building the agent
             st.session_state.last_result = None
-            st.error(f"{type(exc).__name__}: {exc}", title="Analysis failed")
+            st.error(redact_secrets(f"{type(exc).__name__}: {exc}"), title="Analysis failed")
 
 
 # ---- Results ----------------------------------------------------------------
@@ -329,16 +353,12 @@ def _fmt_int(value: int | None) -> str:
     return f"{value:,}" if value is not None else "n/a"
 
 
-def _mentioned(inferred: bool) -> str:
-    return "Implied" if inferred else "Explicit"
+_MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 
 
-_MD_SPECIAL = re.compile(r"([\\`*_{}\[\]<>()#+!|~:$])")
-
-
-def _md_escape(text: str) -> str:
-    """Escape Markdown so model text renders literally inside st.table cells."""
-    return _MD_SPECIAL.sub(r"\\\1", text.replace("\n", " "))
+def _strip_md_images(text: str) -> str:
+    """Drop Markdown images, so model output can't make the browser load a URL."""
+    return _MD_IMAGE.sub("[image removed]", text)
 
 
 def _md_badge(label: str, color: str) -> str:
@@ -367,15 +387,19 @@ def _css_safe(text: str) -> str:
     return text.replace("\\", "/").replace('"', "'").replace("\n", " ")
 
 
-def skills_table(skills) -> "pd.io.formats.style.Styler":
+def skills_table(skills: list[Skill]) -> Styler:
     """Skill table with colored badges; the evidence is a hover tooltip on the skill name."""
 
-    def badges(values: list[str], colors: dict[str, str], labels=None) -> list[str]:
+    def badges(
+        values: list[str], colors: dict[str, str], labels: list[str] | None = None
+    ) -> list[str]:
         labels = labels or values
-        return [_md_badge(lbl, colors.get(v, "gray")) for v, lbl in zip(values, labels)]
+        return [
+            _md_badge(lbl, colors.get(v, "gray")) for v, lbl in zip(values, labels, strict=True)
+        ]
 
     proficiency = [s.proficiency for s in skills]
-    mentioned = [_mentioned(s.inferred) for s in skills]
+    mentioned = [s.mentioned for s in skills]
     df = pd.DataFrame(
         {
             "Skill": [_md_escape(s.name) for s in skills],
@@ -404,7 +428,7 @@ slug = re.sub(r"[^a-z0-9]+", "-", analysis.role_title.lower()).strip("-") or "an
 st.divider()
 head_left, head_right = st.columns([3, 2], vertical_alignment="center")
 with head_left:
-    st.subheader(analysis.role_title)
+    st.subheader(_md_escape(analysis.role_title))
     with st.container(horizontal=True):
         st.badge(analysis.seniority, icon=":material/badge:", color="blue")
         st.badge(f"Interview in {result.study_days} d", icon=":material/event:", color="gray")
@@ -439,7 +463,7 @@ with st.container(horizontal=True):
         help=(
             f"Total: {_fmt_int(usage.total_tokens)}. "
             f"Reasoning: {_fmt_int(usage.reasoning_tokens)}. "
-            f"Model calls: {usage.model_calls}."
+            f"Model calls: {usage.model_calls}. Attempts: {usage.attempts}."
         ),
         border=True,
     )
@@ -457,7 +481,7 @@ if usage.model_name or usage.provider:
 
 if analysis.reasoning:
     with st.expander("Reasoning", icon=":material/lightbulb:"):
-        st.markdown(analysis.reasoning)
+        st.markdown(_strip_md_images(analysis.reasoning))
 
 # Skills (left) and interview topics (right)
 skills_col, topics_col = st.columns(2, gap="large")
@@ -479,10 +503,13 @@ with topics_col:
     )
     for i, topic in enumerate(analysis.interview_topics):
         color = DIFFICULTY_COLORS.get(topic.difficulty, "gray")
-        with st.expander(f"{topic.topic} :{color}-badge[{topic.difficulty}]", expanded=i == 0):
-            st.markdown(f"*{topic.why_likely}*")
+        label = f"{_md_escape(topic.topic)} :{color}-badge[{topic.difficulty}]"
+        with st.expander(label, expanded=i == 0):
+            st.markdown(f"*{_md_escape(topic.why_likely)}*")
             st.markdown(
-                "\n".join(f"{n}. {q}" for n, q in enumerate(topic.example_questions, start=1))
+                "\n".join(
+                    f"{n}. {_md_escape(q)}" for n, q in enumerate(topic.example_questions, start=1)
+                )
             )
 
 
@@ -511,17 +538,20 @@ def render_study_plan(result: AnalysisResult, result_id: int) -> None:
     per_row = 3
     for start in range(0, len(plan), per_row):
         cols = st.columns(per_row)
-        for col, i in zip(cols, range(start, min(start + per_row, len(plan)))):
+        # The last row can have fewer items than columns.
+        for col, i in zip(cols, range(start, min(start + per_row, len(plan))), strict=False):
             item = plan[i]
             block_done = bool(keys[i]) and all(st.session_state.get(k) for k in keys[i])
             with col.container(border=True, height="stretch"):
                 status = " :green[:material/check_circle:]" if block_done else ""
-                st.caption(f"{item.day_or_block} · {item.estimated_hours:g} h{status}")
-                st.markdown(f"**{item.focus}**")
-                for activity, key in zip(item.activities, keys[i]):
-                    st.checkbox(activity, key=key)
+                label = _md_escape(item.day_or_block)
+                st.caption(f"{label} · {item.estimated_hours:g} h{status}")
+                st.markdown(f"**{_md_escape(item.focus)}**")
+                for activity, key in zip(item.activities, keys[i], strict=True):
+                    st.checkbox(_md_escape(activity), key=key)
                 if item.resources:
-                    st.caption(f":material/menu_book: {', '.join(item.resources)}")
+                    resources = ", ".join(_md_escape(r) for r in item.resources)
+                    st.caption(f":material/menu_book: {resources}")
 
 
 render_study_plan(result, st.session_state.result_id)
