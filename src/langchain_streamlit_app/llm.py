@@ -44,9 +44,19 @@ def build_chat_model(settings: ModelSettings) -> ChatOpenRouter:
     )
 
 
-def build_agent(chat_model: ChatOpenRouter, system_prompt: str = DEFAULT_SYSTEM_PROMPT):
-    """Create a tool-less agent around the given chat model."""
-    return create_agent(model=chat_model, tools=[], system_prompt=system_prompt)
+def build_agent(
+    chat_model: ChatOpenRouter,
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    response_format: Any = None,
+):
+    """Create a tool-less agent around the given chat model.
+
+    With `response_format` (e.g. a Pydantic model) the agent returns the parsed
+    result under `result["structured_response"]`.
+    """
+    return create_agent(
+        model=chat_model, tools=[], system_prompt=system_prompt, response_format=response_format
+    )
 
 
 def effective_config(chat_model: ChatOpenRouter) -> dict[str, Any]:
