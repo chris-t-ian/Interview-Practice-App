@@ -10,7 +10,7 @@ from langchain.agents import create_agent
 load_dotenv()
 
 # Any OpenRouter model id works; override with OPENROUTER_MODEL in .env.
-MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-5.5")
+MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-6-luna")
 
 
 @st.cache_resource
