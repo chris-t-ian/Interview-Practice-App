@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Streamlit app that analyses job descriptions for interview prep: key skills, likely interview topics and a study plan."
 readme = "README.md"
 authors = [
-    { name = "email", email = "chris.schneider@tuebingen.mpg.de" }
+    { name = "cschneider", email = "schneider.chris.j@icloud.com" }
 ]
 requires-python = ">=3.14"
 dependencies = [
