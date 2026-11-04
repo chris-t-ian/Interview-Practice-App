@@ -32,6 +32,13 @@ class Skill(BaseModel):
     evidence: str = Field(
         description="Short quote or close paraphrase from the JD that shows this skill is wanted."
     )
+    inferred: bool = Field(
+        default=False,
+        description=(
+            "False if the JD names this skill explicitly; True if it is only clearly implied "
+            "(e.g. 'REST APIs' implied by 'build backend services')."
+        ),
+    )
 
 
 class InterviewTopic(BaseModel):
@@ -73,6 +80,15 @@ class StudyPlanItem(BaseModel):
 class JobAnalysis(BaseModel):
     """Full analysis of a job description for interview preparation."""
 
+    # First field on purpose: structured output is generated in field order, so
+    # reasoning (when requested) is written before the answer fields.
+    reasoning: str | None = Field(
+        default=None,
+        description=(
+            "Optional reasoning or review notes behind the analysis. Fill only when the "
+            "instructions ask for it; otherwise leave null."
+        ),
+    )
     role_title: str = Field(description="Job title as stated or implied by the JD.")
     seniority: Seniority = Field(
         description="Seniority level of the role; use 'unknown' if the JD does not make it clear."
@@ -83,11 +99,4 @@ class JobAnalysis(BaseModel):
     )
     study_plan: list[StudyPlanItem] = Field(
         description="A short, ordered study plan to prepare for the interview topics."
-    )
-    reasoning: str | None = Field(
-        default=None,
-        description=(
-            "Optional step-by-step reasoning behind the analysis. Fill only when asked to "
-            "think step by step; otherwise leave null."
-        ),
     )
